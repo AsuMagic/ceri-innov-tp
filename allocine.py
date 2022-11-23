@@ -8,9 +8,6 @@ from torch.utils.tensorboard import SummaryWriter
 from earlystop import EarlyStopping
 import pandas as pd
 from tqdm import tqdm
-# import dask
-# import dask.dataframe as dd
-# from dask.diagnostics import ProgressBar
 import logging
 
 from allocinexml import load_dataset
@@ -45,7 +42,7 @@ def attach_sentencepiece(df: pd.DataFrame, tokenizer: CamembertTokenizerFast):
         torch.tensor(tokenizer.encode(text, add_special_tokens=True)))
 
 
-def eval(model, loader, ce_3_criterion, device):
+def eval(model, loader, ce_10_criterion, device):
     model.eval()
 
     running_loss = 0.0
@@ -58,7 +55,7 @@ def eval(model, loader, ce_3_criterion, device):
             with torch.autocast(device):
                 class_pred_logits, note_pred = model(batch["tokens"].to(device), batch["masks"].to(device))
                 pred = torch.argmax(class_pred_logits, dim=1).detach().cpu()
-                loss = ce_3_criterion(class_pred_logits, batch["cls_note"].to(device))
+                loss = ce_10_criterion(class_pred_logits, batch["cls_note"].to(device))
 
             matches += (pred == batch["cls_note"]).sum().item()
 
@@ -68,7 +65,7 @@ def eval(model, loader, ce_3_criterion, device):
     return matches / total, running_loss
 
 
-def train(model, loader, ce_3_criterion, regression_criterion, optimizer, scaler, device):
+def train(model, loader, ce_10_criterion, regression_criterion, optimizer, scaler, device):
     running_loss = 0.0
 
     matches = 0
@@ -82,10 +79,10 @@ def train(model, loader, ce_3_criterion, regression_criterion, optimizer, scaler
             class_pred_logits, note_pred = model(batch["tokens"].to(device), batch["masks"].to(device))
             pred = torch.argmax(class_pred_logits, dim=1).detach().cpu()
 
-            ce_3_loss = ce_3_criterion(class_pred_logits, batch["cls_note"].to(device))
+            ce_10_loss = ce_10_criterion(class_pred_logits, batch["cls_note"].to(device))
             regression_loss = regression_criterion(note_pred, batch["note"].to(device))
 
-            loss = ce_3_loss + regression_loss
+            loss = ce_10_loss + regression_loss
 
         matches += (pred == batch["cls_note"]).sum().item()
         total += len(pred)
@@ -170,7 +167,7 @@ def main():
     class_weights = len(train_set) / class_freqs
     logging.info(f"Observed frequencies: {class_freqs} => weights {class_weights}")
 
-    ce_3_loss = nn.CrossEntropyLoss(weight=torch.tensor(class_weights.to_list(), device=args.device))
+    ce_10_loss = nn.CrossEntropyLoss(weight=torch.tensor(class_weights.to_list(), device=args.device))
     regression_loss = nn.MSELoss()
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
@@ -185,13 +182,13 @@ def main():
     best_test_acc = 0
 
     for epoch in range(args.epochs):
-        loss = train(model, train_loader, ce_3_loss, regression_loss, optimizer, scaler, args.device)
+        loss = train(model, train_loader, ce_10_loss, regression_loss, optimizer, scaler, args.device)
         # scheduler.step()
         # scheduler.step(loss)
         
         writer.add_scalar("Loss/train", loss, epoch)
 
-        current_dev_acc, dev_loss = eval(model, dev_loader, ce_3_loss, args.device)
+        current_dev_acc, dev_loss = eval(model, dev_loader, ce_10_loss, args.device)
         writer.add_scalar("Accuracy/dev", current_dev_acc, epoch)
         writer.add_scalar("Loss/dev", dev_loss, epoch)
 

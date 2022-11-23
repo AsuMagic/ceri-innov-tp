@@ -1,8 +1,8 @@
-import random
 import pandas as pd
 import torch
-import torch.nn.utils.rnn as rnn
-import logging
+
+from allocineutil import truncate_if_needed, pad
+
 
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, df: pd.DataFrame):
@@ -15,10 +15,8 @@ class Dataset(torch.utils.data.Dataset):
         row = self.df.iloc[idx]
         tokens = torch.tensor(row["tokens"])
 
-        if len(tokens) > 512:
-            #logging.warning(f"ugly hack: truncating row {idx} tokens from {len(tokens)} to 512")
-            # 0..255 is 256 items, -256..-1 is 256 items
-            tokens = torch.cat((tokens[:256], tokens[-256:]))
+        # FIXME: 512 is the max length of the model; add a parameter to the class
+        tokens = truncate_if_needed(tokens, 512)
 
         return {
             "id": idx,
@@ -27,26 +25,6 @@ class Dataset(torch.utils.data.Dataset):
             "cls_note": torch.tensor(row["cls_note"]),
             "note": torch.tensor(row["note"], dtype=torch.float32)
         }
-
-
-# suboptimal but easier to manipulate padding
-def pad(tensors, pad_symbol: int):
-    max_len = max(len(t) for t in tensors)
-
-    for i in range(len(tensors)):
-        padding_len = max_len - len(tensors[i])
-        left_padding_len = random.randint(0, padding_len)
-        right_padding_len = padding_len - left_padding_len
-
-        left_padding = torch.full((left_padding_len,), pad_symbol)
-        right_padding = torch.full((right_padding_len,), pad_symbol)
-
-        tensors[i] = torch.cat((left_padding, tensors[i], right_padding), dim=-1)
-    
-    tensors = torch.stack(tensors)
-    masks = tensors.ne(pad_symbol).float()
-    
-    return tensors, masks
 
 
 def collate(data, augment=False):

@@ -41,6 +41,7 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("in_xml", type=str)
     parser.add_argument("--pickle-to", type=str)
+    parser.add_argument("--hdf-to", type=str)
     parser.add_argument("--test", default=False, action="store_true")
     args = parser.parse_args()
 
