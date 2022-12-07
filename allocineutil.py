@@ -24,10 +24,10 @@ def pad(tensors, pad_symbol: int):
         right_padding = torch.full((right_padding_len,), pad_symbol)
 
         tensors[i] = torch.cat((left_padding, tensors[i], right_padding), dim=-1)
-    
+
     tensors = torch.stack(tensors)
     masks = tensors.ne(pad_symbol).float()
-    
+
     return tensors, masks
 
 

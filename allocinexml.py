@@ -22,7 +22,7 @@ def load_dataset(xml_path, is_test: bool):
             columns=columns
         )
 
-    logging.info(f"parsing columns")
+    logging.info("parsing columns")
     df["name"]        = df["name"].apply(html.unescape)
     df["movie"]       = df["movie"].astype(int)
     df["review_id"]   = df["review_id"].str[7:].astype(int)
