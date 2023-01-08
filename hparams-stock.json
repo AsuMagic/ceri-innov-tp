@@ -1,0 +1,13 @@
+{
+    "camembert_model": "camembert-base",
+    "device": "cuda",
+    "pre_emb_size": 256,
+    "final_emb_size": 256,
+    "pre_layers": 2,
+    "final_layers": 3,
+    "dropout": 0.0,
+    "batch_size": 96,
+    "lr": 0.01,
+    "removed_layers": 3,
+    "sequence_processor": "gru"
+}

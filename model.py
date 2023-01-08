@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 from transformers import CamembertModel, CamembertTokenizerFast
 from tqdm import tqdm
-
 from allocineutil import get_rating_value, pad, truncate_if_needed
 
 
@@ -13,36 +12,58 @@ class SentimentPredictor(nn.Module):
         self,
         bert: CamembertModel,
         bert_ablated_layers: int,
-        gru_emb_size: int = 256,
+        pre_emb_size: int = 256,
         final_emb_size: int = 256,
+        pre_layers: int = 2,
+        final_layers: int = 2,
+        dropout: float = 0.0,
+        sequence_processor: str = "gru",
     ):
         super().__init__()
 
         self.bert = bert
         self.bert_ablated_layers = bert_ablated_layers
 
+        self.dropout = dropout
+
         camembert_size = bert.config.hidden_size
 
         self.preprocess_tokens = nn.Sequential(
-            nn.Linear(camembert_size, gru_emb_size),
+            nn.Linear(camembert_size, pre_emb_size),
+            nn.Dropout(dropout),
             nn.Hardswish(),
-            nn.Linear(gru_emb_size, gru_emb_size),
-            nn.Hardswish(),
+
+            *[nn.Sequential(
+                nn.Linear(pre_emb_size, pre_emb_size),
+                nn.Dropout(dropout),
+                nn.Hardswish(),
+            ) for _ in range(pre_layers - 1)]
         )
 
-        self.bert_gru = nn.GRU(
-            gru_emb_size,
-            gru_emb_size//2,
-            2,
-            bidirectional=True,
-            batch_first=True
-        )
+        self.sequence_processor = sequence_processor
+
+        if sequence_processor == "gru":
+            self.bert_gru = nn.GRU(
+                pre_emb_size,
+                pre_emb_size//2,
+                2,
+                bidirectional=True,
+                batch_first=True
+            )
+        elif sequence_processor == "pool":
+            pass
 
         self.final = nn.Sequential(
-            nn.Linear(final_emb_size, final_emb_size),
+            nn.Linear(pre_emb_size, final_emb_size),
+            nn.Dropout(dropout),
             nn.Hardswish(),
-            nn.Linear(final_emb_size, final_emb_size),
-            nn.Hardswish(),
+
+            *[nn.Sequential(
+                nn.Linear(final_emb_size, final_emb_size),
+                nn.Dropout(dropout),
+                nn.Hardswish(),
+            ) for _ in range(final_layers - 2)],
+
             nn.Linear(final_emb_size, 11)  # 10 classes, 1 numeric for rating
         )
 
@@ -58,16 +79,20 @@ class SentimentPredictor(nn.Module):
 
     def process_bert_output(self, x):
         x = self.preprocess_tokens(x)
-        x, _h = self.bert_gru(x)
-        x = x[:, -1, :]  # only care about the last output
+
+        if self.sequence_processor == "gru":
+            x, _h = self.bert_gru(x)
+            x = x[:, -1, :]  # only care about the last output
+        elif self.sequence_processor == "pool":
+            x = torch.mean(x, dim=1)
 
         x = self.final(x)
 
         return x
 
     def forward(self, toks, mask=None):
+        print(toks.shape)
         x = self.bert(toks, attention_mask=mask)[0]
-
         x = self.process_bert_output(x)
 
         class_pred = x[..., :-1]
@@ -94,7 +119,7 @@ def chunker(seq, size):
 
 class AllocinePredictor:
     def __init__(self, path, device):
-        bert_name = "camembert-base"
+        bert_name = "camembert/camembert-large"
 
         self.tokenizer = CamembertTokenizerFast.from_pretrained(bert_name)
         camembert = CamembertModel.from_pretrained(bert_name)
@@ -102,8 +127,8 @@ class AllocinePredictor:
 
         state = torch.load(path, map_location=torch.device(device))
 
-        self.model = SentimentPredictor(camembert)
-        self.model.load_state_dict(state["model_state_dict"], strict=False)
+        # HUGE HACK; this should be encoded in the json state of the checkpoint!!
+        self.model = SentimentPredictor(camembert, 4, 128, 128, 3, 3)
 
         # Make sure we're removing as many layers as the model was trained with
         # bert_ablated_layers was loaded from the state dict above, so we can
@@ -111,13 +136,14 @@ class AllocinePredictor:
         # TODO: is there a better way to achieve this?
         behead_camembert(self.model.bert, self.model.bert_ablated_layers)
 
+        self.model.load_state_dict(state["model_state_dict"], strict=False)
         self.model.bert.load_state_dict(state["model_state_dict"], strict=False)
 
         self.device = device
         self.model.bert.to(device)
         self.model.to(device)
 
-    def __call__(self, inputs: List[str], batch_size: int = 32, use_tqdm: bool = False):
+    def __call__(self, inputs: List[str], batch_size: int = 8, use_tqdm: bool = False):
         preds = []
 
         with torch.no_grad():
@@ -126,7 +152,8 @@ class AllocinePredictor:
             def encode_sentence(text):
                 tokens = torch.tensor(self.tokenizer.encode(text, add_special_tokens=True))
 
-                max_bert_tokens = self.model.bert.config.max_position_embeddings
+                # max_bert_tokens = self.model.bert.config.max_position_embeddings - 1
+                max_bert_tokens = 500 # HACK: an off-by-one error breaks things otherwise
 
                 tokens = truncate_if_needed(tokens, max_bert_tokens)
                 return tokens

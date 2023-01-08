@@ -1,19 +1,26 @@
+import logging
+import math
+from argparse import ArgumentParser
+from functools import partialmethod
+from pathlib import Path
+
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from transformers import CamembertModel, CamembertTokenizerFast
-from argparse import ArgumentParser
-from tqdm import tqdm
+from ray import tune
+from ray.tune import CLIReporter
+from ray.tune.schedulers import ASHAScheduler
 from torch.utils.tensorboard import SummaryWriter
-from earlystop import EarlyStopping
-import pandas as pd
-import logging
+from tqdm import tqdm
+from transformers import CamembertModel, CamembertTokenizerFast
 
+# attach_test_metadata
+from allocinedataset import Dataset, make_loader
 from allocineutil import (
     attach_train_metadata,
-    # attach_test_metadata
 )
-from allocinedataset import Dataset, make_loader
+from earlystop import EarlyStopping
 from model import SentimentPredictor
 
 
@@ -64,13 +71,13 @@ def eval(model, loader, ce_10_criterion, device):
     return matches / total, running_loss
 
 
-def train(model, loader, ce_10_criterion, regression_criterion, optimizer, scaler, device):
+def train(model, loader, ce_10_criterion, regression_criterion, optimizer, scaler, device, use_tqdm=True):
     running_loss = 0.0
 
     matches = 0
     total = 0
 
-    for batch in (pbar := tqdm(loader)):
+    for batch in (pbar := tqdm(loader, disable=not use_tqdm)):
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
@@ -99,85 +106,65 @@ def train(model, loader, ce_10_criterion, regression_criterion, optimizer, scale
     return running_loss
 
 
-def main():
-    logging.basicConfig(level=logging.INFO)
+def load_dataset(path, sample_frac=1.0):
+    logging.info(f"Loading {path}, sampling {sample_frac:.2%}")
+    x = pd.read_pickle(path)
+    x = Dataset(x)
+    attach_train_metadata(x.df)
+    if sample_frac < 1.0:
+        x.df = x.df.sample(frac=sample_frac)
 
-    tqdm.pandas()
+    return x
 
-    parser = ArgumentParser()
-    parser.add_argument("ckpt", type=str)
+def train_model(config):
+    # writer = SummaryWriter(comment=args.comment)
 
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--device", type=str, default="cuda")
+    # which dataset to load, depending on the used camembert model?
+    if "large" in config["camembert_model"]:
+        sets = config["sets"]["large"]
+    else:
+        sets = config["sets"]["base"]
 
-    parser.add_argument("--freeze-camembert", default=False, action="store_true")
-    parser.add_argument("--camembert-model", type=str, default="camembert-base")
-    parser.add_argument("--camembert-removed-layers", type=int, default=3)
+    # import the dataset with the proper % of samples
+    # in hyperparameter search, we use a fraction of the dataset
+    train_set = load_dataset(sets["train"], config["train_frac"])
+    dev_set = load_dataset(sets["dev"], config["dev_frac"])
 
-    parser.add_argument("--train-path", type=str, required=True)
-    parser.add_argument("--dev-path", type=str, required=True)
+    train_loader = make_loader(train_set, config["batch_size"], train=True)
+    dev_loader = make_loader(dev_set, config["batch_size"])
 
-    parser.add_argument("--lr", type=float, default=0.001)
+    # load camembert, apply the number of layers to remove
+    tokenizer, camembert = load_camembert(config["camembert_model"], False)
+    camembert.to(config["device"])
+    behead_camembert(camembert, config["removed_layers"])
 
-    parser.add_argument("--batch-size", type=int, default=96)
-
-    parser.add_argument("--comment", type=str, default="")
-
-    parser.add_argument("--workers", type=int, default=4)
-
-    args = parser.parse_args()
-
-    writer = SummaryWriter(comment=args.comment)
-
-    tokenizer, camembert = load_camembert(args.camembert_model, args.freeze_camembert)
-    camembert.to(args.device)
-    behead_camembert(camembert, args.camembert_removed_layers)
-
-    def load_set(path):
-        logging.info(f"Loading {path}")
-        x = pd.read_pickle(path)
-        x = Dataset(x)
-
-        return x
-
-    train_set = load_set(args.train_path)
-    dev_set = load_set(args.dev_path)
-    # test_set = load_set("dataset/test-metadata.bin.zst")
-
-    attach_train_metadata(train_set.df)
-    attach_train_metadata(dev_set.df)
-    # attach_test_metadata(test_set.df)
-
-    train_loader = make_loader(train_set, args.batch_size, train=True)
-    dev_loader = make_loader(dev_set, args.batch_size)
-    # test_loader = make_loader(test_set, args.batch_size)
-
-    # Juicy model stuff
-    logging.info("Setting up model")
-
+    # create the model
     model = SentimentPredictor(
         camembert,
-        args.camembert_removed_layers
-    )
-
-    #model = torch.jit.script(model)
-    model.to(args.device)
+        config["removed_layers"],
+        config["pre_emb_size"],
+        config["final_emb_size"],
+        config["pre_layers"],
+        config["final_layers"],
+        config["dropout"],
+        config["sequence_processor"]
+    ).to(config["device"])
 
     # example_forward_input = train_set[0]["tokens"].unsqueeze(0).to(args.device)
     # writer.add_graph(model, example_forward_input)
     # del example_forward_input
 
-    # We use a custom loss function to handle the fact that the dataset is imbalanced
+    # we use a custom loss function to handle the fact that the dataset is imbalanced
     class_freqs = train_set.df["cls_note"].value_counts().sort_index()
     class_weights = len(train_set) / class_freqs
     logging.info(f"Observed frequencies: {class_freqs} => weights {class_weights}")
 
-    # We use the regression loss to make the model learn to predict an exact rating
+    # we use the regression loss to make the model learn to predict an exact rating
     # TODO: need to test if this makes a difference; make it an option
-    ce_10_loss = nn.CrossEntropyLoss(weight=torch.tensor(class_weights.to_list(), device=args.device))
+    ce_10_loss = nn.CrossEntropyLoss(weight=torch.tensor(class_weights.to_list(), device=config["device"]))
     regression_loss = nn.MSELoss()
 
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = optim.AdamW(model.parameters(), lr=config["lr"])
     scaler = torch.cuda.amp.GradScaler()
     early_stop = EarlyStopping(5, 0.01)
 
@@ -187,33 +174,155 @@ def main():
 
     best_dev_acc = 0
 
-    for epoch in range(args.epochs):
-        loss = train(model, train_loader, ce_10_loss, regression_loss, optimizer, scaler, args.device)
+    for epoch in range(config["max_epochs"]):
+        loss = train(
+            model,
+            train_loader,
+            ce_10_loss,
+            regression_loss,
+            optimizer,
+            scaler,
+            config["device"],
+            use_tqdm=not config["tuning"]
+        )
+
+        if math.isnan(loss):
+            raise ValueError("Loss is NaN")
+
         # scheduler.step()
         # scheduler.step(loss)
         
-        writer.add_scalar("Loss/train", loss, epoch)
+        # writer.add_scalar("Loss/train", loss, epoch)
 
-        current_dev_acc, dev_loss = eval(model, dev_loader, ce_10_loss, args.device)
-        writer.add_scalar("Accuracy/dev", current_dev_acc, epoch)
-        writer.add_scalar("Loss/dev", dev_loss, epoch)
+        current_dev_acc, dev_loss = eval(model, dev_loader, ce_10_loss, config["device"])
+        # writer.add_scalar("Accuracy/dev", current_dev_acc, epoch)
+        # writer.add_scalar("Loss/dev", dev_loss, epoch)
 
-        early_stop.update(current_dev_acc)
-        if early_stop.should_stop():
-            print("Early stopping patience exhausted; decided we should stop.")
-            break
+        # early_stop.update(current_dev_acc)
+        # if early_stop.should_stop():
+        #     print("Early stopping patience exhausted; decided we should stop.")
+        #     break
 
         if current_dev_acc > best_dev_acc:
             best_dev_acc = current_dev_acc
-            # best_test_acc, test_loss = eval(model, test_loader, criterion, args.device)
+            # best_test_acc, test_loss = eval(model, test_loader, criterion, config["device"])
             # writer.add_scalar("Accuracy/test", best_test_acc, epoch)
             # writer.add_scalar("Loss/test", test_loss, epoch)
 
+        if config["tuning"]:
+            with tune.checkpoint_dir(epoch) as checkpoint_dir:
+                path = Path(checkpoint_dir) / "checkpoint"
+                torch.save({
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict()
+                }, path)
+
+            tune.report(loss=dev_loss, accuracy=current_dev_acc)
+        else:
+            path = Path(config["save_dir"]) / f"checkpoint-{epoch}.pt"
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict()
-            }, args.ckpt)
+            }, path)
 
 
 if __name__ == "__main__":
-    main()
+    logging.basicConfig(level=logging.INFO)
+
+    tqdm.pandas()
+
+    parser = ArgumentParser()
+
+    parser.add_argument("--device", type=str, default="cuda")
+
+    # use subparsers to decide for hyperparameter search or training
+    subparsers = parser.add_subparsers(dest="mode")
+
+    # hyperparameter search
+    hp_parser = subparsers.add_parser("hyperparam")
+    
+    # training
+    train_parser = subparsers.add_parser("train")
+    train_parser.add_argument("--hparams", type=str, default="hparams-stock.json")
+    train_parser.add_argument("--max-epochs", type=int, default=10)
+    train_parser.add_argument("--save-dir", type=str, default="checkpoints")
+
+    args = parser.parse_args()
+
+    if args.mode == "hyperparam":
+        tqdm.__init__ = partialmethod(tqdm.__init__, disable=True)
+        config = {
+            "camembert_model": tune.choice([
+                "camembert-base",
+                # no tokenizers
+                # "camembert/camembert-base-ccnet",
+                # "camembert/camembert-base-oscar-4gb",
+                "camembert/camembert-large"
+            ]),
+            "pre_emb_size": tune.choice([32, 64, 128, 256]),
+            "final_emb_size": tune.choice([32, 64, 128, 256]),
+            "pre_layers": tune.choice([1, 2, 3]),
+            "final_layers": tune.choice([2, 3, 4]),
+            "dropout": tune.uniform(0.0, 0.5),
+            "batch_size": tune.choice([8, 16, 32, 64, 96]),
+            "lr": tune.loguniform(1e-4, 1e-1),
+            "removed_layers": tune.choice([0, 1, 2, 3, 4, 5, 6]),
+            "sequence_processor": tune.choice(["gru", "pool"]),
+            "max_epochs": 100,
+            "tuning": True,
+            "train_frac": 0.3,
+            "dev_frac": 0.5
+        }
+    elif args.mode == "train":
+        import json
+        with open(args.hparams, "r") as f:
+            config = json.load(f)
+        config.update({
+            "max_epochs": args.max_epochs,
+            "save_dir": args.save_dir,
+            "tuning": False,
+            "train_frac": 1.0,
+            "dev_frac": 1.0,
+        })
+    
+    config.update({
+        "device": args.device,
+        "sets": {
+            "base": {
+                "train": Path("dataset/camembert-base/train-metadata.bin.zst").resolve(),
+                "dev": Path("dataset/camembert-base/dev-metadata.bin.zst").resolve(),
+            },
+            "large": {
+                "train": Path("dataset/camembert-large/train-metadata.bin.zst").resolve(),
+                "dev": Path("dataset/camembert-large/dev-metadata.bin.zst").resolve(),
+            }
+        }
+    })
+
+    if args.mode == "hyperparam":
+        scheduler = ASHAScheduler(
+            metric="loss",
+            mode="min",
+            max_t=15,
+            grace_period=1,
+            reduction_factor=2)
+        reporter = CLIReporter(
+            # parameter_columns=["l1", "l2", "lr", "batch_size"],
+            metric_columns=["loss", "accuracy", "training_iteration"])
+
+        result = tune.run(
+            train_model,
+            resources_per_trial={"cpu": 2, "gpu": 1},
+            config=config,
+            scheduler=scheduler,
+            num_samples=30,
+            progress_reporter=reporter)
+
+        best_trial = result.get_best_trial("loss", "min", "last")
+        print("Best trial config: {}".format(best_trial.config))
+        print("Best trial final validation loss: {}".format(
+            best_trial.last_result["loss"]))
+        print("Best trial final validation accuracy: {}".format(
+            best_trial.last_result["accuracy"]))
+    elif args.mode == "train":
+        train_model(config)

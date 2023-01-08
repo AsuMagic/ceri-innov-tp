@@ -1,0 +1,13 @@
+{
+    "batch_size": 8,
+    "camembert_model": "camembert/camembert-large",
+    "dropout": 0.12031969937980097,
+    "final_emb_size": 128,
+    "final_layers": 3,
+    "lr": 0.00042703419128531747,
+    "max_epochs": 100,
+    "pre_emb_size": 128,
+    "pre_layers": 3,
+    "removed_layers": 4,
+    "sequence_processor": "gru"
+}

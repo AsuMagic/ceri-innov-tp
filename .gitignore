@@ -1,5 +1,6 @@
 __pycache__
 dataset/
+models/
 runs/
 run_history/
 dump.*
